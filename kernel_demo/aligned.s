@@ -1,9 +1,11 @@
 // aligned.s and shifted.s differ only by
 // the `s_nop 0` before .Lloop (present in shifted.s only). The 320-byte prologue puts .Lloop on a 32-byte boundary in aligned.s.
 //
-// valu_loop(uint64_t *out, uint32_t iters, uint32_t waves_per_group)
-//   Each wave runs `iters` iterations of 64 independent v_pk_mul_f32 and
-//   writes the s_memtime cycle count of its loop to out[group * waves_per_group + wave].
+// valu_loop(uint32_t iters)
+//   Each wave runs `iters` iterations of 64 independent v_pk_mul_f32 and writes nothing.
+//   Time it by wall clock, or per instruction with an ATT trace. There is no s_memtime:
+//   rocprof-trace-decoder classifies it as SALU, the hardware traces it as SMEM, and the
+//   mismatch stops stitching, so no instruction after it maps to the code.
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx950"
 	.amdhsa_code_object_version 5
 	.text
@@ -11,9 +13,7 @@
 	.p2align	8
 	.type	valu_loop,@function
 valu_loop:
-	s_load_dwordx4 s[4:7], s[0:1], 0x0          // s[4:5] out, s6 iters, s7 waves_per_group
-	v_readfirstlane_b32 s8, v0
-	s_lshr_b32 s8, s8, 6                        // s8 = wave index within the group
+	s_load_dword s6, s[0:1], 0x0                // s6 = iters
 	v_mov_b32_e32 v0, 1.0
 	v_mov_b32_e32 v1, 1.0
 	v_mov_b32_e32 v2, 1.0
@@ -87,8 +87,11 @@ valu_loop:
 	v_mov_b32_e32 v70, 1.0
 	v_mov_b32_e32 v71, 1.0
 	s_waitcnt lgkmcnt(0)
-	s_memtime s[10:11]
-	s_waitcnt lgkmcnt(0)
+	s_nop 0                                     // 5 x s_nop 0: pad the prologue to 320 bytes
+	s_nop 0
+	s_nop 0
+	s_nop 0
+	s_nop 0
 .Lloop:
 	v_pk_mul_f32 v[0:1], v[0:1], v[64:65]
 	v_pk_mul_f32 v[2:3], v[2:3], v[64:65]
@@ -157,20 +160,6 @@ valu_loop:
 	s_sub_u32 s6, s6, 1
 	s_cmp_lg_u32 s6, 0
 	s_cbranch_scc1 .Lloop
-	s_memtime s[12:13]
-	s_waitcnt lgkmcnt(0)
-	s_sub_u32 s12, s12, s10
-	s_subb_u32 s13, s13, s11                    // s[12:13] = loop cycles
-	s_mul_i32 s14, s2, s7                       // s2 = workgroup id x
-	s_add_u32 s14, s14, s8
-	s_lshl_b32 s14, s14, 3
-	s_add_u32 s4, s4, s14
-	s_addc_u32 s5, s5, 0
-	v_mov_b32_e32 v0, 0
-	v_mov_b32_e32 v2, s12
-	v_mov_b32_e32 v3, s13
-	s_mov_b64 exec, 1
-	global_store_dwordx2 v0, v[2:3], s[4:5]
 	s_endpgm
 .Lfunc_end:
 	.size	valu_loop, .Lfunc_end-valu_loop
@@ -180,7 +169,7 @@ valu_loop:
 	.amdhsa_kernel valu_loop
 		.amdhsa_group_segment_fixed_size 0
 		.amdhsa_private_segment_fixed_size 0
-		.amdhsa_kernarg_size 16
+		.amdhsa_kernarg_size 4
 		.amdhsa_user_sgpr_count 2
 		.amdhsa_user_sgpr_kernarg_segment_ptr 1
 		.amdhsa_system_sgpr_workgroup_id_x 1
@@ -196,19 +185,12 @@ valu_loop:
 amdhsa.kernels:
   - .agpr_count:     0
     .args:
-      - .address_space:  global
-        .offset:         0
-        .size:           8
-        .value_kind:     global_buffer
-      - .offset:         8
-        .size:           4
-        .value_kind:     by_value
-      - .offset:         12
+      - .offset:         0
         .size:           4
         .value_kind:     by_value
     .group_segment_fixed_size: 0
-    .kernarg_segment_align: 8
-    .kernarg_segment_size: 16
+    .kernarg_segment_align: 4
+    .kernarg_segment_size: 4
     .max_flat_workgroup_size: 1024
     .name:           valu_loop
     .private_segment_fixed_size: 0

@@ -1,5 +1,5 @@
 // Load two code objects that contain `valu_loop`, run them interleaved, and
-// compare per-wave loop cycles (s_memtime) and wall time (hipEvent).
+// compare their wall time (hipEvent). For cycles per iteration, take an ATT trace.
 //
 // Usage: launcher <aligned.hsaco> <shifted.hsaco> [--iters N] [--blocks B]
 //                 [--threads T] [--lds BYTES] [--reps R] [--device D]
@@ -31,7 +31,7 @@ struct Args {
   std::string paths[2];
   uint32_t iters = 20000;
   int blocks = 0;        // 0: one per CU
-  int threads = 256;     // 256 = 1 wave per SIMD
+  int threads = 64;      // 64 = 1 wave per CU; 256 = 1 wave per SIMD
   int lds = 96 * 1024;   // dynamic LDS per group; 96 KB keeps one group per CU
   int reps = 5;
   int device = 0;
@@ -66,31 +66,19 @@ double median(std::vector<double> v) {
   return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
 
-struct Sample {
-  double wall_ms;
-  double cycles_per_iter;  // median over waves
-};
-
-Sample run(hipFunction_t fn, const Args& a, int blocks, uint64_t* d_out, std::vector<uint64_t>& h_out,
-           hipEvent_t start, hipEvent_t stop) {
-  struct {
-    uint64_t* out;
-    uint32_t iters;
-    uint32_t waves_per_group;
-  } kargs{d_out, a.iters, static_cast<uint32_t>(a.threads / 64)};
-  size_t size = sizeof(kargs);
-  void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &kargs, HIP_LAUNCH_PARAM_BUFFER_SIZE, &size,
+// Returns the wall time of one launch in ms.
+double run(hipFunction_t fn, const Args& a, int blocks, hipEvent_t start, hipEvent_t stop) {
+  uint32_t iters = a.iters;  // the only kernel argument
+  size_t size = sizeof(iters);
+  void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &iters, HIP_LAUNCH_PARAM_BUFFER_SIZE, &size,
                     HIP_LAUNCH_PARAM_END};
-  CHECK(hipMemset(d_out, 0, h_out.size() * sizeof(uint64_t)));
   CHECK(hipEventRecord(start));
   CHECK(hipModuleLaunchKernel(fn, blocks, 1, 1, a.threads, 1, 1, a.lds, nullptr, nullptr, config));
   CHECK(hipEventRecord(stop));
   CHECK(hipEventSynchronize(stop));
   float ms = 0;
   CHECK(hipEventElapsedTime(&ms, start, stop));
-  CHECK(hipMemcpy(h_out.data(), d_out, h_out.size() * sizeof(uint64_t), hipMemcpyDeviceToHost));
-  std::vector<double> cyc(h_out.begin(), h_out.end());
-  return {ms, median(cyc) / a.iters};
+  return ms;
 }
 
 }  // namespace
@@ -114,10 +102,6 @@ int main(int argc, char** argv) {
     CHECK(hipModuleGetFunction(&fn[k], mod[k], "valu_loop"));
   }
 
-  size_t waves = static_cast<size_t>(blocks) * (a.threads / 64);
-  uint64_t* d_out;
-  CHECK(hipMalloc(&d_out, waves * sizeof(uint64_t)));
-  std::vector<uint64_t> h_out(waves);
   hipEvent_t start, stop;
   CHECK(hipEventCreate(&start));
   CHECK(hipEventCreate(&stop));
@@ -126,28 +110,25 @@ int main(int argc, char** argv) {
   std::printf("grid %d x %d threads (%d waves/group), %u iterations x %d v_pk_mul_f32, dynamic LDS %d B\n",
               blocks, a.threads, a.threads / 64, a.iters, kLoopInsts, a.lds);
 
-  for (int k = 0; k < 2; ++k) run(fn[k], a, blocks, d_out, h_out, start, stop);  // warm-up
+  for (int k = 0; k < 2; ++k) run(fn[k], a, blocks, start, stop);  // warm-up
 
-  std::vector<double> wall[2], cyc[2];
+  std::vector<double> wall[2];
   for (int r = 0; r < a.reps; ++r) {
     for (int j = 0; j < 2; ++j) {
       int k = (r + j) % 2;  // alternate which kernel runs first
-      Sample s = run(fn[k], a, blocks, d_out, h_out, start, stop);
-      wall[k].push_back(s.wall_ms);
-      cyc[k].push_back(s.cycles_per_iter);
+      wall[k].push_back(run(fn[k], a, blocks, start, stop));
     }
   }
 
-  std::printf("\n%-8s %12s %16s %16s\n", "kernel", "wall ms", "cycles/iter", "cycles/inst");
-  double base_ms = median(wall[0]), base_cyc = median(cyc[0]);
+  std::printf("\n%-8s %12s\n", "kernel", "wall ms");
+  double base_ms = median(wall[0]);
   for (int k = 0; k < 2; ++k) {
-    double ms = median(wall[k]), c = median(cyc[k]);
-    std::printf("%-8s %12.3f %16.1f %16.2f", names[k], ms, c, c / kLoopInsts);
-    if (k) std::printf("   (%+.1f%% wall, %+.1f%% cycles vs aligned)", 100 * (ms / base_ms - 1), 100 * (c / base_cyc - 1));
+    double ms = median(wall[k]);
+    std::printf("%-8s %12.3f", names[k], ms);
+    if (k) std::printf("   (%+.1f%% vs aligned)", 100 * (ms / base_ms - 1));
     std::printf("\n");
   }
 
-  CHECK(hipFree(d_out));
   for (int k = 0; k < 2; ++k) CHECK(hipModuleUnload(mod[k]));
   return 0;
 }

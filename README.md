@@ -1,4 +1,4 @@
-# gfx950 instruction-alignment demo: one `s_nop`, 13% slower
+# gfx950 instruction-alignment demo: one `s_nop`, 22% slower
 
 On AMD Instinct MI350X (gfx950), an 8-byte instruction that crosses a 32-byte
 boundary issues 4 cycles late. If no other wave on the same SIMD is ready to
@@ -22,38 +22,52 @@ In each directory, the two kernels differ by exactly one line:
 
 ```
 $ diff kernel_demo/aligned.s kernel_demo/shifted.s
-91a92
+94a95
 > 	s_nop 0                                     // the only difference: +4 bytes
 $ diff kernel_gemm/aligned.s kernel_gemm/shifted.s
 941d940
 < 	s_nop 0
 ```
 
-## Results (MI350X, ROCm 7.2)
+## Results (MI350X)
 
 | pair | kernel | 8-byte loop insts crossing 32 B | time |
 |---|---|---:|---:|
-| `kernel_demo`, 1 wave per SIMD | aligned | 0 of 64 | 288.0 cycles/iter, 3.538 ms |
-| | shifted | 16 of 64 | **352.0 cycles/iter** (+64), 4.018 ms (**+13.6%**) |
+| `kernel_demo`, 1 wave per CU | aligned | 0 of 64 | 288 cycles/iter, 2.644 ms |
+| | shifted | 16 of 64 | **352 cycles/iter** (+64), 3.226 ms (**+22.0%**) |
 | `kernel_gemm` | aligned | 28 of 444 | 177.3 µs, 787 TFLOPS |
 | | shifted | 77 of 444 | 182.3 µs (**+2.8%**; 2.8–3.3% over repeated runs) |
 
-**`kernel_demo`:** the extra 64 cycles per iteration are exactly
-16 crossings × 4 cycles. With more waves per SIMD, the other waves fill most of
-the bubbles: wall time is only +2.3% at 2 waves per SIMD and +2.1% at 4.
+`kernel_demo` was measured with ROCm 10.1, `kernel_gemm` with ROCm 7.2.
 
-| waves per SIMD | launcher `--threads` | aligned wall | shifted wall | shifted vs aligned |
+**`kernel_demo`:** the extra 64 cycles per iteration are exactly
+16 crossings × 4 cycles. The cycles/iter come from ATT traces of all 256 CUs,
+4 dispatches per kernel: every CU ran the loop in exactly 288 (aligned) or 352
+(shifted) cycles. Wall time grows by 22.0%, close to 352 / 288 = 1.222.
+
+| waves per CU | launcher `--threads` | aligned wall | shifted wall | shifted vs aligned |
 |---:|---:|---:|---:|---:|
-| 1 | 256 | 3.538 ms | 4.018 ms | **+13.6%** |
-| 2 | 512 | 5.782 ms | 5.913 ms | +2.3% |
-| 4 | 1024 | 10.519 ms | 10.744 ms | +2.1% |
+| 1 | 64 | 2.644 ms | 3.226 ms | **+22.0%** |
+| 2 | 128 | 2.655 ms | 3.230 ms | +21.6% |
+| 3 | 192 | 2.654 ms | 3.233 ms | +21.8% |
+| 4 (1 per SIMD) | 256 | 3.551 ms | 4.032 ms | +13.6% |
+| 8 (2 per SIMD) | 512 | 5.802 ms | 5.971 ms | +2.9% |
+| 16 (4 per SIMD) | 1024 | 10.524 ms | 10.747 ms | +2.1% |
+
+- **1 to 3 waves per CU:** each wave has a SIMD to itself, and the full penalty
+  shows. One earlier run on another GPU gave +19.8% and +15.9% at 2 and 3 waves
+  per CU; that GPU later carried outside load, so the difference is unconfirmed.
+- **4 waves per CU:** some CUs run the loop in a slower state that hides part of
+  the penalty; see [Fast and slow CUs](#4-waves-per-cu-fast-and-slow-cus).
+- **2 or more waves per SIMD:** the other waves on the SIMD fill most of the
+  bubbles.
 
 **`kernel_gemm`:** both kernels write bit-identical outputs, and the output
 matches a CPU reference.
 
 ## Build and run
 
-Requires ROCm (tested with 7.2) and a gfx950 GPU. In either directory:
+Requires ROCm (tested with 7.2 and 10.1) and a gfx950 GPU. In either directory:
 
 ```bash
 cd kernel_demo        # or kernel_gemm
@@ -78,31 +92,65 @@ An 8-byte instruction crosses a 32-byte boundary when its address is 28 mod 32.
 
 ## `kernel_demo`: synthetic loop
 
-`valu_loop(out, iters, waves_per_group)` runs `iters` iterations of 64
+`valu_loop(iters)` runs `iters` iterations of 64
 independent `v_pk_mul_f32` (8 bytes each, 32 packed accumulators, so there are
-no dependency stalls). Each wave reads `s_memtime` around the loop and stores
-its cycle count.
+no dependency stalls) and writes nothing.
 
-- `aligned.s`: the prologue is 320 bytes, so the loop starts on a 32-byte
-  boundary and no loop instruction crosses one.
+- `aligned.s`: the prologue is 320 bytes, five `s_nop 0` of it padding, so the
+  loop starts on a 32-byte boundary and no loop instruction crosses one.
 - `shifted.s`: the same code plus `s_nop 0` before the loop. The nop runs once
   per wave, but it moves every loop instruction to an address that is 4 mod 8,
   so every fourth 8-byte instruction crosses a 32-byte boundary.
 
 The launcher allocates 96 KB of dynamic LDS per workgroup, so each CU runs
-exactly one workgroup and `--threads 256` gives one wave per SIMD.
+exactly one workgroup. `--threads 64`, the default, gives one wave per CU;
+`--threads 256` gives one wave per SIMD.
 
 Launcher options:
 - `--iters N` (20000)
 - `--blocks B` (one per CU)
-- `--threads T` (256)
+- `--threads T` (64)
 - `--lds BYTES` (98304)
 - `--reps R` (5)
 - `--device D` (0)
 
-`cycles/iter` is each wave's own loop time. With one wave per SIMD, it is the
-issue cost of the loop. With more waves per SIMD, it also includes the cycles
-in which the SIMD issues for other waves, so compare wall time there.
+The launcher reports wall time only. For cycles per iteration, take an ATT
+trace (`rocprofv3 --att`) and read the time between consecutive
+`s_cbranch_scc1` of one wave. The kernel has no `s_memtime`: the hardware traces
+it as an SMEM instruction, rocprof-trace-decoder classifies it as SALU, and the
+mismatch stops the decoder from mapping any later instruction, the whole loop
+included, to the code.
+
+For the loop rate of every CU, trace all shader engines
+(`--att-shader-engine-mask 0xFFFFFFFF`): `occupancy.json` in each
+`ui_output_*` directory holds the start and end time of every wave.
+
+### 4 waves per CU: fast and slow CUs
+
+ATT traces of all 256 CUs at `--threads 256` (8 dispatches of aligned, 2 of
+shifted) show every CU running the loop at one of two rates:
+
+| kernel | fast CU | slow CU |
+|---|---:|---:|
+| aligned | 288 cycles/iter | 384 cycles/iter |
+| shifted | 352 cycles/iter | 432–440 cycles/iter |
+
+- **State per CU:** all 4 waves of a CU share it. Every wave's first iteration
+  takes about 380 cycles. A CU either drops to the fast rate within 1–3
+  iterations or stays slow, then keeps its state for the rest of the 20000
+  iterations.
+- **Where the time goes:** in a slow CU, the extra cycles fall on the first
+  ~10 instructions after the loop's backward branch, the first two 64-byte
+  lines of the loop. The waves wait for instructions after jumping back.
+- **How many:** 27–80% of CUs were slow in each aligned dispatch. The share did
+  not follow the loop's start address mod 128, the shader clock, or which of
+  the two loaded copies of the code ran.
+- **Effect on wall time:** every dispatch had slow CUs, and they set the
+  dispatch time: about 384 cycles/iter for aligned against 440 for shifted, so
+  wall time grows by 13.6% instead of 22%.
+- **Cause:** unknown. In 12 traced dispatches at 1 or 2 waves per CU, no CU was
+  slow, so the CU's waves seem to delay each other's instruction fetch after
+  the branch.
 
 ## `kernel_gemm`: the GEMM where this showed up
 
@@ -151,4 +199,5 @@ Options: `--iters N` (100), `--device D` (0).
 
 The 32-byte figure and the 4-cycle cost come from measurement on gfx950 (this
 repo and the ATT trace above), not from documentation. Other architectures and
-occupancies may behave differently.
+occupancies may behave differently, and the slow CU state at 4 waves per CU is
+not explained.
